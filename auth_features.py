@@ -1,0 +1,45 @@
+import os, pathlib, re, time
+HERE = pathlib.Path(__file__).resolve().parent; OUT = os.environ.get("E2E_OUT", str(HERE / "out")); os.makedirs(OUT, exist_ok=True)
+B = os.environ.get("E2E_BASE", "http://localhost:5173"); API = os.environ.get("E2E_API", "http://localhost:8000")
+from playwright.sync_api import sync_playwright
+res = []
+def ck(n, ok, d=""): res.append(ok); print(("PASS " if ok else "FAIL ") + n + (" | " + str(d)[:120] if d else ""), flush=True)
+EMAIL = f"e2e{int(time.time())}@example.com"; PW = "Correct horse 42!"; NEW = "Another strong pass 7!"
+with sync_playwright() as pw:
+    b = pw.chromium.launch(); ctx = b.new_context(viewport={"width": 1440, "height": 900}); p = ctx.new_page(); p.set_default_timeout(15000); errs = []
+    p.on("pageerror", lambda e: errs.append(str(e)[:120]))
+    p.goto(B + "/dashboard"); p.wait_for_url("**/login?next=%2Fdashboard"); ck("protected route redirects guests to login", "/login" in p.url, p.url)
+    ck("workspace stays usable as a guest", p.goto(B + "/workspace").status == 200 and "Reconcile purchases" in p.inner_text("main"))
+    p.goto(B + "/signup"); p.get_by_label("Name").fill("E2E Tester"); p.get_by_label("Email").fill(EMAIL)
+    p.locator("#pw").fill("abc"); weak = p.inner_text("main"); p.locator("#pw").fill(PW); strong = p.inner_text("main")
+    ck("password-strength indicator reacts", "Very weak" in weak or "Weak" in weak, weak[weak.find("Strength"):][:30]); ck("strong password rated Good/Strong", "Good" in strong or "Strong" in strong)
+    ck("password hidden by default", p.locator("#pw").get_attribute("type") == "password"); p.get_by_role("button", name="Show password").first.click(); ck("visibility toggle reveals it", p.locator("#pw").get_attribute("type") == "text")
+    p.locator("#pw2").fill("different"); p.get_by_role("button", name="Create account").click(); p.wait_for_selector("text=do not match"); ck("mismatched confirmation is rejected", True)
+    p.locator("#pw2").fill(PW); p.get_by_role("button", name="Create account").click(); p.wait_for_url("**/dashboard"); p.wait_for_selector("text=No reconciliations yet"); ck("signup creates account, lands on empty dashboard with empty state", True)
+    ck("account avatar shown in header", p.get_by_label("Account settings").count() == 1)
+    p.goto(B + "/workspace?demo=1"); p.wait_for_selector("text=Result categories"); p.wait_for_timeout(500); p.locator("tbody tr").first.click(); p.get_by_role("button", name="Accept match").click(); p.wait_for_selector("text=Match accepted"); ck("toast appears on accepting a match", True); p.keyboard.press("Escape")
+    p.get_by_label("Filter by status").select_option("Amount Mismatch"); p.locator("tbody tr").first.click(); p.wait_for_selector("[role=dialog]")
+    ck("field-by-field 'differs' marker on an Amount Mismatch row", p.locator("[role=dialog] >> text=differs").count() >= 1 and p.locator("[role=dialog] >> text=same").count() >= 1); p.keyboard.press("Escape")
+    p.goto(B + "/dashboard"); p.wait_for_selector("text=Reconciliation history"); p.wait_for_timeout(1500); t = p.inner_text("main")
+    stats = ctx.request.get(API + "/api/stats").json()["stats"]
+    ck("dashboard numbers equal the API/database", stats["reconciliations"] == 1 and stats["purchase_invoices"] == 40 and "65.0%" in t and "26/40 matched" in t, (stats["match_rate"], "65.0%" in t))
+    ck("history row expands with category counts", (p.locator("[aria-expanded]").last.click() or True) and (p.wait_for_selector("text=Missing in GSTR-2B: 5") is not None))
+    p.keyboard.press("Control+k"); p.wait_for_selector("[role=dialog][aria-label='Command palette']"); p.keyboard.type("sett"); p.keyboard.press("Enter"); p.wait_for_url("**/settings"); ck("Ctrl+K palette navigates by keyboard", True)
+    th = p.evaluate("document.documentElement.dataset.theme"); p.get_by_label(re.compile("Switch to (light|dark) theme")).first.click(); th2 = p.evaluate("document.documentElement.dataset.theme"); p.reload(); th3 = p.evaluate("document.documentElement.dataset.theme")
+    ck("theme toggle switches and persists across reload", th == "dark" and th2 == "light" and th3 == "light", (th, th2, th3)); p.screenshot(path=OUT + "/F-light-settings.png")
+    p.get_by_label(re.compile("Switch to dark theme")).first.click()
+    p.get_by_role("tab", name="Security").click(); p.locator("#cur").fill(PW); p.locator("#new").fill(NEW); p.get_by_role("button", name="Change password").click(); p.wait_for_selector("text=Password changed"); ck("password change works", True)
+    p.get_by_role("button", name="Sign out").click(); p.get_by_role("dialog", name="Confirm sign out").get_by_role("button", name="Sign out").click(); p.wait_for_url(B + "/"); ck("logout via confirm modal", ctx.request.get(API + "/api/auth/me").status == 401)
+    p.goto(B + "/login"); p.get_by_label("Email").fill(EMAIL); p.locator("#pw").fill(PW); p.get_by_role("button", name="Sign in").click(); p.wait_for_selector("text=Incorrect email or password"); ck("old password rejected after change", True)
+    p.locator("#pw").fill(NEW); p.get_by_role("button", name="Sign in").click(); p.wait_for_url("**/dashboard"); ck("login with new password", True)
+    p.goto(B + "/forgot"); p.get_by_label("Email").fill(EMAIL); p.get_by_role("button", name="Send reset link").click(); p.wait_for_selector("text=reset link was printed"); ck("forgot password shows honest 'no email service' message", "No email service" in p.inner_text("main"))
+    # effects: present on a fine pointer, absent on touch and with reduced motion
+    ck("magic cursor + spotlight present on desktop", p.locator(".cursor-ring").count() == 1 and p.locator(".fx-spot").count() == 1)
+    t2 = b.new_context(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True).new_page(); t2.goto(B + "/"); t2.wait_for_timeout(1500); ck("no custom cursor on touch devices", t2.locator(".cursor-ring").count() == 0)
+    r2 = b.new_context(viewport={"width": 1440, "height": 900}, reduced_motion="reduce").new_page(); r2.goto(B + "/"); r2.wait_for_timeout(1500)
+    ck("reduced motion: no cursor, no particles, no blob animation", r2.locator(".cursor-ring").count() == 0 and r2.locator(".dust").count() == 0 and r2.evaluate("getComputedStyle(document.querySelector('.fx-bg .blob')).animationName") == "none")
+    p.goto(B + "/"); p.wait_for_timeout(1500); p.locator(".spot").first.hover(); p.wait_for_timeout(300); ck("card spotlight variables update on hover", p.evaluate("document.querySelector('.spot').style.getPropertyValue('--sx')") != "")
+    ck("six-stage workflow in the real order", [x.inner_text().split("\n")[0] for x in p.locator("#how ol li").all()][:6] == ["1 · UPLOAD", "2 · VALIDATE", "3 · NORMALIZE", "4 · MATCH", "5 · REVIEW", "6 · EXPORT"], [x.inner_text().split("\n")[0] for x in p.locator("#how ol li").all()])
+    p.goto(B + "/dashboard"); p.wait_for_selector("text=Reconciliation history"); p.wait_for_timeout(2000); p.screenshot(path=OUT + "/F-dashboard.png"); p.goto(B + "/signup"); p.wait_for_timeout(600); p.locator("#pw").fill("Correct horse 42!"); p.screenshot(path=OUT + "/F-signup.png")
+    b.close()
+print("page errors:", sorted(set(errs)) or "none"); print("SUMMARY:", sum(res), "pass /", len(res))
